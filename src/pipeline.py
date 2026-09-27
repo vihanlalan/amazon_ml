@@ -98,9 +98,57 @@ def eval_truth(W, frac):
                     | ((pl.col("q").hash(seed=3) % 1000) < int(frac * 1000)))
 
 
-def cmd_train(W, sample, rounds, frac, final_thr=None):
+# --- model backends --------------------------------------------------------------------
+# lgbm (CPU, default) or xgb (XGBoost, Apache-2.0) which can train/predict on a CUDA GPU.
+XGB_PARAMS = dict(objective="binary:logistic", eval_metric="logloss", tree_method="hist",
+                  learning_rate=0.08, max_depth=10, min_child_weight=5, subsample=0.8,
+                  colsample_bytree=0.8, reg_lambda=1.0, max_bin=256)
+
+
+def fit_model(X, y, rounds, model="lgbm", device="cpu"):
+    if model == "xgb":
+        import xgboost as xgb
+        dtrain = xgb.QuantileDMatrix(X, label=y, max_bin=XGB_PARAMS["max_bin"])
+        return xgb.train({**XGB_PARAMS, "device": device}, dtrain, num_boost_round=rounds)
+    params = dict(PARAMS)
+    if device == "cuda":   # needs a CUDA-enabled LightGBM build
+        params["device_type"] = "cuda"
+    return lgb.train(params, lgb.Dataset(X, y), num_boost_round=rounds)
+
+
+def predict_model(m, meta, X):
+    if meta.get("model", "lgbm") == "xgb":
+        return m.inplace_predict(X)
+    return m.predict(X)
+
+
+def save_model(m, W, meta):
+    if meta["model"] == "xgb":
+        m.save_model(os.path.join(W, "model_xgb.json"))
+    else:
+        m.save_model(os.path.join(W, "model.txt"))
+
+
+def load_model(W, meta):
+    if meta.get("model", "lgbm") == "xgb":
+        import xgboost as xgb
+        m = xgb.Booster()
+        m.load_model(os.path.join(W, "model_xgb.json"))
+        m.set_param({"device": meta.get("device", "cpu")})
+        return m
+    return lgb.Booster(model_file=os.path.join(W, "model.txt"))
+
+
+def importance(m, meta, feats):
+    if meta["model"] == "xgb":
+        g = m.get_score(importance_type="total_gain")
+        return sorted(((f, g.get(f"f{i}", 0.0)) for i, f in enumerate(feats)), key=lambda x: -x[1])
+    return sorted(zip(feats, m.feature_importance("gain")), key=lambda x: -x[1])
+
+
+def cmd_train(W, sample, rounds, frac, final_thr=None, model="lgbm", device="cpu"):
     t = time.time()
-    feats = None
+    meta = {"model": model, "device": device}
     oof = []
     res = {}
     # final_thr given: skip the (slow) 2-fold OOF pass and reuse a known threshold
@@ -108,19 +156,19 @@ def cmd_train(W, sample, rounds, frac, final_thr=None):
         tr = _load_feats(W, "train", sample=sample, fold=1 - fold)
         cols = feature_names(tr)
         print(f"fold {fold}: train rows {tr.height}, pos {tr['label'].mean():.3f}", flush=True)
-        ds = lgb.Dataset(tr.select(cols).to_numpy().astype(np.float32), tr["label"].to_numpy())
+        X, y = tr.select(cols).to_numpy().astype(np.float32), tr["label"].to_numpy()
         del tr
-        m = lgb.train(PARAMS, ds, num_boost_round=rounds)
-        del ds
+        m = fit_model(X, y, rounds, model, device)
+        del X, y
         for f in sorted(glob.glob(os.path.join(W, "feat_train", "*.parquet"))):
             ch = pl.read_parquet(f).filter(_fold() == fold)
             if ch.height == 0:
                 continue
             p = ch.select("s1", "q", "label").with_columns(
-                pl.Series("p", m.predict(ch.select(cols).to_numpy().astype(np.float32))))
+                pl.Series("p", predict_model(m, meta, ch.select(cols).to_numpy().astype(np.float32))))
             # a query's candidates all live in one chunk: keep only its best S1 (saves memory)
             oof.append(p.sort("p", descending=True).unique("q", keep="first"))
-        feats = cols
+        del m
         print(f"  fold {fold} done ({time.time() - t:.0f}s)", flush=True)
     if final_thr:
         best = final_thr
@@ -137,38 +185,59 @@ def cmd_train(W, sample, rounds, frac, final_thr=None):
     # final model on both folds
     tr = _load_feats(W, "train", sample=sample)
     feats = feature_names(tr)
-    m = lgb.train(PARAMS, lgb.Dataset(tr.select(feats).to_numpy().astype(np.float32), tr["label"].to_numpy()),
-                  num_boost_round=rounds)
-    m.save_model(os.path.join(W, "model.txt"))
-    imp = sorted(zip(feats, m.feature_importance("gain")), key=lambda x: -x[1])
-    print("top features:", [(a, int(b)) for a, b in imp[:20]])
-    json.dump({"thr": best, "features": feats, "cv": res}, open(os.path.join(W, "model_meta.json"), "w"), indent=1)
+    X, y = tr.select(feats).to_numpy().astype(np.float32), tr["label"].to_numpy()
+    del tr
+    m = fit_model(X, y, rounds, model, device)
+    meta.update({"thr": best, "features": feats, "cv": res})
+    save_model(m, W, meta)
+    print("top features:", [(a, int(b)) for a, b in importance(m, meta, feats)[:20]])
+    json.dump(meta, open(os.path.join(W, "model_meta.json"), "w"), indent=1)
+    print(f"train done ({time.time() - t:.0f}s)")
 
 
-def cmd_predict(W, out):
+def cmd_predict(W, out, reuse=False):
+    """Score every test candidate pair, then write the two TSVs. Predictions are written
+    per feature chunk (never all in RAM); `reuse` skips scoring if they already exist."""
     meta = json.load(open(os.path.join(W, "model_meta.json")))
-    m = lgb.Booster(model_file=os.path.join(W, "model.txt"))
-    preds = []
-    for f in sorted(glob.glob(os.path.join(W, "feat_test", "*.parquet"))):
-        ch = pl.read_parquet(f)
-        preds.append(ch.select("s1", "q").with_columns(
-            pl.Series("p", m.predict(ch.select(meta["features"]).to_numpy().astype(np.float32)))))
-    pred = pl.concat(preds)
-    pred.write_parquet(os.path.join(W, "pred_test.parquet"))
-    write_outputs(W, pred, decide(pred, meta["thr"]), out)
+    pdir = os.path.join(W, "pred_test")
+    if not (reuse and glob.glob(os.path.join(pdir, "*.parquet"))):
+        os.makedirs(pdir, exist_ok=True)
+        m = load_model(W, meta)
+        for f in sorted(glob.glob(os.path.join(W, "feat_test", "*.parquet"))):
+            ch = pl.read_parquet(f)
+            ch.select("s1", "q").with_columns(
+                pl.Series("p", predict_model(m, meta, ch.select(meta["features"]).to_numpy().astype(np.float32)),
+                          dtype=pl.Float32)
+            ).write_parquet(os.path.join(pdir, os.path.basename(f)))
+            print("  scored", os.path.basename(f), flush=True)
+    write_outputs(W, pl.scan_parquet(os.path.join(pdir, "*.parquet")), meta["thr"], out)
 
 
-def write_outputs(W, cand, match, out):
-    """Write candidate_pairs.tsv and matching_results.tsv (one row per test S1 entity)."""
+def write_outputs(W, pred: pl.LazyFrame, thr: float, out: str, parts: int = 8):
+    """Write matching_results.tsv and candidate_pairs.tsv (one row per test S1 entity).
+    Streams over hash partitions so ~80M scored pairs never sit in memory at once."""
     os.makedirs(out, exist_ok=True)
+    # pass 1 - decision rule: each query goes to its best S1 if p >= thr (partition by query)
+    match = []
+    for i in range(parts):
+        d = pred.filter(pl.col("q").hash(seed=5) % parts == i).collect()
+        match.append(decide(d, thr))
+        del d
+    match = pl.concat(match)
+    # pass 2 - group per S1 (partition by S1)
     s1 = pl.read_parquet(os.path.join(W, "test_source1.parquet"), columns=["entity_id"])
-    for df, col, name in ((cand, "candidate_entity_ids", "candidate_pairs.tsv"),
-                          (match, "matched_entity_ids", "matching_results.tsv")):
-        g = df.select("s1", "q").unique().sort("q").group_by("s1").agg(pl.col("q").str.join(",").alias(col))
-        res = (s1.join(g, left_on="entity_id", right_on="s1", how="left")
+    cand = []
+    for i in range(parts):
+        d = pred.filter(pl.col("s1").hash(seed=5) % parts == i).select("s1", "q").collect()
+        cand.append(d.unique().sort("q").group_by("s1").agg(pl.col("q").str.join(",").alias("candidate_entity_ids")))
+        del d
+    for df, col, name in ((pl.concat(cand), "candidate_entity_ids", "candidate_pairs.tsv"),
+                          (match.unique().sort("q").group_by("s1").agg(pl.col("q").str.join(",").alias("matched_entity_ids")),
+                           "matched_entity_ids", "matching_results.tsv")):
+        res = (s1.join(df, left_on="entity_id", right_on="s1", how="left")
                .select(pl.col("entity_id").alias("source1_entity_id"), pl.col(col).fill_null("")))
-        res.write_csv(os.path.join(out, name), separator="\t", quote_style="never")
-        print(f"wrote {name}: {res.height} rows, {(res[col] != '').sum()} non-empty")
+        res.write_csv(os.path.join(out, name), separator="	", quote_style="never")
+        print(f"wrote {name}: {res.height} rows, {(res[col] != '').sum()} non-empty", flush=True)
 
 
 def main():
@@ -180,14 +249,17 @@ def main():
     ap.add_argument("--sample", type=float, default=0.25)
     ap.add_argument("--rounds", type=int, default=400)
     ap.add_argument("--final_thr", type=float, default=None)
+    ap.add_argument("--model", choices=["lgbm", "xgb"], default="lgbm")
+    ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    ap.add_argument("--reuse", action="store_true", help="predict: reuse saved test predictions")
     ap.add_argument("--out", default="output")
     a = ap.parse_args()
     if a.cmd == "build":
         cmd_build(a.work, a.split, a.frac)
     elif a.cmd == "train":
-        cmd_train(a.work, a.sample, a.rounds, a.frac, a.final_thr)
+        cmd_train(a.work, a.sample, a.rounds, a.frac, a.final_thr, a.model, a.device)
     else:
-        cmd_predict(a.work, a.out)
+        cmd_predict(a.work, a.out, a.reuse)
 
 
 if __name__ == "__main__":

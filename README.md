@@ -34,6 +34,22 @@ python path/to/student_resource/utils/validate_submission.py \
     --test-dir path/to/student_resource/dataset/test
 ```
 
+### GPU training (optional)
+
+Training can run on an NVIDIA GPU with XGBoost (Apache-2.0, `pip install xgboost`):
+
+```bash
+python src/pipeline.py train   --work work --model xgb --device cuda --sample 1.0 --rounds 800
+python src/pipeline.py predict --work work --out output
+```
+
+With a GPU (and enough RAM) use `--sample 1.0` to train on every train query instead of 25%,
+and more rounds. The CV macro F0.5 is printed per threshold. Compare it with the LightGBM run
+(0.942) before switching. Blocking and feature building stay on the CPU (sparse top-k search +
+rapidfuzz); they are the long steps, and a machine with more RAM/cores speeds them up.
+
+`predict --reuse` rewrites the TSVs from saved predictions without rescoring.
+
 `train --final_thr 0.35` skips the OOF pass (saves ~15 min) and trains only the final model.
 `build` resumes per country: if a run dies, delete the partial `work/feat_<split>/<Country>_*.parquet`
 files of the country that was in progress and rerun.

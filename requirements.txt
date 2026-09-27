@@ -7,3 +7,6 @@ pyarrow==21.0.0
 RapidFuzz==3.14.6
 scipy==1.16.0
 sparse-dot-topn==1.2.0
+
+# optional: GPU training backend
+# xgboost==3.0.5
