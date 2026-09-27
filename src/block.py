@@ -55,8 +55,10 @@ def token_frame(df: pl.DataFrame) -> pl.DataFrame:
     kw = pl.col("k").list.eval(pl.element().filter(pl.element().str.len_chars() >= 2)).list.unique()
     aw = pl.col("a").list.eval(pl.element().filter(
         (pl.element().str.len_chars() >= 3) & ~pl.element().str.contains(r"\d"))).list.unique()
-    pb = base.select("row", kw.alias("kw"), aw.alias("aw"))
-    parts = [_pairs(pb, "kw", "kw", True), _pairs(pb, "kw", "aw", False), _pairs(pb, "aw", "aw", True)]
+    # cap address words: long (Indian) addresses would otherwise explode quadratically
+    pb = base.select("row", kw.list.head(5).alias("kw"), aw.list.head(8).alias("aw"),
+                     aw.list.head(6).alias("aw6"))
+    parts = [_pairs(pb, "kw", "kw", True), _pairs(pb, "kw", "aw", False), _pairs(pb, "aw6", "aw6", True)]
     for f, minlen in (("n", 2), ("k", 2), ("a", 1), ("d", 3), ("c", 4)):
         t = base.select("row", pl.col(f).alias("tok")).explode("tok")
         t = t.filter(pl.col("tok").str.len_chars() >= minlen)
@@ -71,7 +73,7 @@ def _pairs(pb: pl.DataFrame, lc: str, rc: str, same: bool) -> pl.DataFrame:
     t = pb.select("row", pl.col(lc).alias("_l"), pl.col(rc).alias("_r")).explode("_l").explode("_r").drop_nulls()
     if same:
         t = t.filter(pl.col("_l") < pl.col("_r"))
-    tag = "nn" if lc == rc == "kw" else ("na" if lc != rc else "aa")
+    tag = {"kw": "nn", "aw6": "aa"}[lc] if lc == rc else "na"
     return t.select("row", (pl.lit(tag + ":") + pl.col("_l") + "|" + pl.col("_r")).alias("tok"),
                     pl.lit("x").alias("f"))
 
@@ -144,7 +146,9 @@ def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
         qc = q.filter(pl.col("country") == country)
         if s1c.height == 0 or qc.height == 0:
             continue
-        tf1 = token_frame(s1c)
+        # token table of the index built in slices (memory), row ids shifted back to global
+        tf1 = pl.concat([token_frame(s1c.slice(o, 200_000)).with_columns(pl.col("row") + o)
+                         for o in range(0, s1c.height, 200_000)])
         idf = make_idf(tf1, s1c.height, max_df_frac)  # max_df_frac scales DF_CAP
         M1 = {c: build_matrix(tf1, s1c.height, idf, w) for c, w in CHANNELS.items()}
         B = {c: M1[c].T.tocsr() for c in CHANNELS}
