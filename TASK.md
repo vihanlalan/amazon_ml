@@ -43,6 +43,30 @@ For every S1 record, find all S2/S3 records that are the same business.
    best S1 if probability ≥ threshold. Writes `output/matching_results.tsv` and
    `output/candidate_pairs.tsv`.
 
+### UPDATE 17:40 IST: fastest route to the best score (run THIS if the machine has ≥32 GB RAM)
+
+The v1 leaderboard score was 0.939 and the target is ≥0.985. Blocking recall is still the main
+error source (v2: US 98.1%, India 95.1%), and a big machine can afford looser blocking. Run everything
+with the **`big` profile** (both builds MUST use the same profile) and more training queries:
+
+```bash
+git pull
+export BLOCK_PROFILE=big                     # Windows PowerShell: $env:BLOCK_PROFILE="big"
+python src/convert.py  --data student_resource/dataset --work work
+python src/prep.py     --work work
+python src/eval_block.py --work work --frac 0.03 --country India   # optional sanity check: recall@10 should be > 0.95
+python src/pipeline.py build --work work --split train --frac 0.5
+python src/pipeline.py build --work work --split test              # can run in parallel with the train build
+python src/pipeline.py train --work work --frac 0.5 --model xgb --device cuda --sample 1.0 --rounds 800
+python src/pipeline.py predict --work work --out output
+python student_resource/utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir student_resource/dataset/test
+```
+
+* `--frac` must be the **same** for `build --split train` and `train`.
+* If memory runs out, drop to `--frac 0.3` (rebuild train) and/or unset `BLOCK_PROFILE`.
+* Report the `best thr ... : 0.9xxx` line from `train`: it's the validation estimate we compare
+  against the laptop run.
+
 ### UPDATE 17:15 IST: v2 blocking (pushed; use this version)
 
 The first leaderboard submission scored **0.939** (the CV said 0.942, so the CV is reliable).

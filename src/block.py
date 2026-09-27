@@ -191,3 +191,14 @@ def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
                 out.append(res)
             print(f"  {country}: {off + qq.height}/{qc.height} queries", flush=True)
     return pl.concat(out) if out else None
+
+
+# --- machine profile -----------------------------------------------------------------------
+# BLOCK_PROFILE=big (for >=32 GB RAM machines): looser DF caps and more candidates per channel.
+# Higher blocking recall (the main error source) at ~3x the blocking cost. The default
+# ("laptop") keeps the settings above. Train and test MUST be built with the same profile.
+if os.environ.get("BLOCK_PROFILE", "laptop") == "big":
+    DF_CAP = {"n": 0.01, "k": 0.01, "a": 0.01, "d": 0.01, "c": 0.003, "x": 0.01}
+    TOPK = {"full": 8, "name": 5, "addr": 5, "pair": 12}
+    PRUNE = {"full": 14, "name": 8, "addr": 8, "pair": 30}
+    MAX_CAND = 15
