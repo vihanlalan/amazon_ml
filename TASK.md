@@ -104,6 +104,8 @@ python src/pipeline.py build --work work --split test
 * If a build crashes mid-country, delete that country's partial `work/feat_<split>/<Country>_*.parquet`
   files and rerun. Completed countries are skipped.
 * Don't change `block.py`, `features.py` or `normalize.py` between the train and test builds.
+* **If you build train with `--frac 0.5`, pass the same `--frac 0.5` to every `train` command
+  below.** The CV score is computed on exactly the sampled queries; a mismatch gives a wrong score.
 
 ### Step 3: train on the GPU (≈10–30 min)
 
