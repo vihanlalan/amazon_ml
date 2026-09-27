@@ -43,6 +43,31 @@ For every S1 record, find all S2/S3 records that are the same business.
    best S1 if probability ≥ threshold. Writes `output/matching_results.tsv` and
    `output/candidate_pairs.tsv`.
 
+### UPDATE 21:15 IST: NEXT RUN = `src/stack.py` (no rebuild needed)
+
+Last run scored **0.961** on the leaderboard. The v2 error analysis shows ~0.018 of F0.5 is lost
+*inside* the candidate set (false merges on shifted-house-number distractors, true matches ranked
+second or below threshold). New **stage-2 model** (`src/stack.py`): it adds S1-group consistency
+features (how many confident candidates an S1 has, whether they agree with the S1's house number,
+how many queries chose this S1 as their best, ...) on top of the stage-1 probabilities.
+Folds are split by S1 (no leakage); test groups mimic the train sampling (no train/test shift).
+
+**It reuses your existing `work/feat_train` + `work/feat_test`; don't rebuild anything.**
+
+```bash
+git pull
+python src/stack.py --work work --frac <F> --out output_stack --model xgb --device cuda --sample 1.0 --rounds 800
+#   <F> = the SAME --frac you used for `pipeline.py build --split train`
+#         (0.5 if you followed the "big" section below; 0.3 if you used run_all.sh / the default)
+#   no GPU / CUDA error:  --model lgbm --device cpu --sample 0.5 --rounds 400
+python student_resource/utils/validate_submission.py --matching output_stack/matching_results.tsv --candidate output_stack/candidate_pairs.tsv --test-dir student_resource/dataset/test
+```
+
+It prints `stage1 CV best thr ...` and `stage2 CV best thr ...` and writes the outputs of whichever
+is higher to `output_stack/` (the choice is also saved in `work/stack_meta.json`).
+**Upload `output_stack/matching_results.tsv` only if the printed best CV is higher than the CV of
+the run that scored 0.961.** Send back both CV lines. Expected runtime: roughly 30–60 min on a GPU machine.
+
 ### UPDATE 17:40 IST: fastest route to the best score (run THIS if the machine has ≥32 GB RAM)
 
 The v1 leaderboard score was 0.939 and the target is ≥0.985. Blocking recall is still the main

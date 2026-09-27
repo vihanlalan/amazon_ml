@@ -46,8 +46,8 @@ def cmd_build(W, split, frac):
     countries = (pl.scan_parquet(os.path.join(W, f"norm_{split}_source1.parquet"))
                  .select(pl.col("country").unique()).collect()["country"].to_list())
     for country in sorted(countries):
-        if glob.glob(os.path.join(out_dir, f"{country}_*.parquet")):
-            continue  # resume support
+        if os.path.exists(os.path.join(out_dir, f"{country}.done")):
+            continue  # resume support (finished countries); unfinished ones resume per chunk
         s1 = _load(W, split, (1,), country)
         q = _load(W, split, (2, 3), country, frac if split == "train" else None)
         print(f"{country}: {s1.height} S1, {q.height} queries", flush=True)
@@ -61,6 +61,7 @@ def cmd_build(W, split, frac):
             return f
 
         topk_candidates(s1, q, out_dir=out_dir, post=post)
+        open(os.path.join(out_dir, f"{country}.done"), "w").close()
         print(f"{country} done ({time.time() - t:.0f}s)", flush=True)
         del s1, q
 
@@ -82,6 +83,34 @@ def _load_feats(W, split, sample=None, fold=None):
     if sample:
         lf = lf.filter((pl.col("q").hash(seed=11) % 1000) < int(sample * 1000))
     return lf.collect()
+
+
+def _load_xy(W, split, sample=None, fold=None):
+    """Features straight into a pre-sized float32 array, file by file (no big dataframe),
+    so more training rows fit in RAM."""
+    files = sorted(glob.glob(os.path.join(W, f"feat_{split}", "*.parquet")))
+
+    def lf(f):
+        x = pl.scan_parquet(f)
+        if fold is not None:
+            x = x.filter(_fold() == fold)
+        if sample:
+            x = x.filter((pl.col("q").hash(seed=11) % 1000) < int(sample * 1000))
+        return x
+
+    n = sum(lf(f).select(pl.len()).collect().item() for f in files)
+    feats = feature_names(pl.scan_parquet(files[0]).head(1).collect())
+    X = np.empty((n, len(feats)), dtype=np.float32)
+    y = np.empty(n, dtype=np.int8)
+    o = 0
+    for f in files:
+        ch = lf(f).select(*feats, "label").collect()
+        k = ch.height
+        X[o:o + k] = ch.select(feats).to_numpy().astype(np.float32)
+        y[o:o + k] = ch["label"].to_numpy()
+        o += k
+        del ch
+    return X, y, feats
 
 
 def decide(pred: pl.DataFrame, thr: float) -> pl.DataFrame:
@@ -153,11 +182,8 @@ def cmd_train(W, sample, rounds, frac, final_thr=None, model="lgbm", device="cpu
     res = {}
     # final_thr given: skip the (slow) 2-fold OOF pass and reuse a known threshold
     for fold in (() if final_thr else (0, 1)):
-        tr = _load_feats(W, "train", sample=sample, fold=1 - fold)
-        cols = feature_names(tr)
-        print(f"fold {fold}: train rows {tr.height}, pos {tr['label'].mean():.3f}", flush=True)
-        X, y = tr.select(cols).to_numpy().astype(np.float32), tr["label"].to_numpy()
-        del tr
+        X, y, cols = _load_xy(W, "train", sample=sample, fold=1 - fold)
+        print(f"fold {fold}: train rows {len(y)}, pos {y.mean():.3f}", flush=True)
         m = fit_model(X, y, rounds, model, device)
         del X, y
         for f in sorted(glob.glob(os.path.join(W, "feat_train", "*.parquet"))):
@@ -183,10 +209,7 @@ def cmd_train(W, sample, rounds, frac, final_thr=None, model="lgbm", device="cpu
         print(f"best thr {best}: {res[best]:.5f}")
         del oof
     # final model on both folds
-    tr = _load_feats(W, "train", sample=sample)
-    feats = feature_names(tr)
-    X, y = tr.select(feats).to_numpy().astype(np.float32), tr["label"].to_numpy()
-    del tr
+    X, y, feats = _load_xy(W, "train", sample=sample)
     m = fit_model(X, y, rounds, model, device)
     meta.update({"thr": best, "features": feats, "cv": res})
     save_model(m, W, meta)
@@ -248,12 +271,16 @@ def main():
     ap.add_argument("--frac", type=float, default=TRAIN_QUERY_FRAC)
     ap.add_argument("--sample", type=float, default=0.25)
     ap.add_argument("--rounds", type=int, default=400)
+    ap.add_argument("--lr", type=float, default=None, help="learning rate override")
     ap.add_argument("--final_thr", type=float, default=None)
     ap.add_argument("--model", choices=["lgbm", "xgb"], default="lgbm")
     ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     ap.add_argument("--reuse", action="store_true", help="predict: reuse saved test predictions")
     ap.add_argument("--out", default="output")
     a = ap.parse_args()
+    if a.lr:
+        PARAMS["learning_rate"] = a.lr
+        XGB_PARAMS["learning_rate"] = a.lr
     if a.cmd == "build":
         cmd_build(a.work, a.split, a.frac)
     elif a.cmd == "train":

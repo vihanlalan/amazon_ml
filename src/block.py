@@ -155,6 +155,8 @@ def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
         del tf1
         s1_ids = s1c["entity_id"].to_numpy()
         for off in range(0, qc.height, chunk):
+            if out_dir and os.path.exists(f"{out_dir}/{country}_{off // chunk:04d}.parquet"):
+                continue  # chunk-level resume after a crash
             qq = qc.slice(off, chunk)
             t0 = time.time()
             tfq = token_frame(qq)
