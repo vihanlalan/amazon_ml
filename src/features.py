@@ -6,6 +6,7 @@ Feature groups
   * address: fuzzy similarities on full address and on its alphabetic part, house-number
              agreement (distractors copy the address with a slightly shifted number)
   * context: blocking score, rank, gap to the query's best S1, candidate counts, source
+  * semantic: deep cosine similarity using a lightweight Transformer model
 Country is never used as a categorical feature, so unseen countries (France) are handled
 by the same country-agnostic signals.
 """
@@ -14,6 +15,17 @@ import polars as pl
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 from rapidfuzz.process import cpdist
+
+# Lazy-loaded for memory efficiency
+_SBERT_MODEL = None
+
+def get_sbert():
+    global _SBERT_MODEL
+    if _SBERT_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        # all-MiniLM-L6-v2 is fast, small (~80MB), and very effective for short text
+        _SBERT_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return _SBERT_MODEL
 
 NCOLS = ["entity_id", "name_n", "core_n", "skel", "addr_n", "nums", "legal"]
 
@@ -49,6 +61,8 @@ def pair_features(pairs: pl.DataFrame, s1n: pl.DataFrame, qn: pl.DataFrame) -> p
     alpha = lambda xs: [" ".join(t for t in x.split() if not any(ch.isdigit() for ch in t)) for x in xs]
     aaa, aab = alpha(aa), alpha(ab)
     nospace = lambda xs: [x.replace(" ", "") for x in xs]
+
+    # Basic Fuzzy Features
     f = {
         "name_ratio": _sim(na, nb, fuzz.ratio),
         "name_tset": _sim(na, nb, fuzz.token_set_ratio),
@@ -66,6 +80,12 @@ def pair_features(pairs: pl.DataFrame, s1n: pl.DataFrame, qn: pl.DataFrame) -> p
         "addr_alpha_tset": _sim(aaa, aab, fuzz.token_set_ratio),
         "addr_alpha_partial": _sim(aaa, aab, fuzz.partial_ratio),
     }
+
+    # Semantic Features (The "Leap")
+    model = get_sbert()
+    emb_a = model.encode(ca, convert_to_tensor=False, show_progress_bar=False)
+    emb_b = model.encode(cb, convert_to_tensor=False, show_progress_bar=False)
+    f["semantic_sim"] = np.sum(emb_a * emb_b, axis=1) if emb_a.ndim > 1 else np.dot(emb_a, emb_b)
     out = d.select(
         "s1", "q", "rank", "q_ncand", pl.col("^s_(full|name|addr|pair).*$"),
         pl.col("q").str.starts_with("S2").cast(pl.Int8).alias("is_s2"),

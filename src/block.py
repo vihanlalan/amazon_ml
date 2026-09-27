@@ -135,7 +135,7 @@ def _rowdot(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarray) 
 
 
 def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
-                    chunk: int = 50_000, n_threads: int = max(os.cpu_count() - 2, 1), topk: dict = None,
+                    chunk: int = 10_000, n_threads: int = 1, topk: dict = None,
                     out_dir: str = None, post=None) -> pl.DataFrame:
     """For each query row, the union of per-channel top-k S1 rows of the same country.
     Returns (s1, q, s_full, s_name, s_addr, score, rank)."""
@@ -149,47 +149,71 @@ def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
         # token table of the index built in slices (memory), row ids shifted back to global
         tf1 = pl.concat([token_frame(s1c.slice(o, 200_000)).with_columns(pl.col("row") + o)
                          for o in range(0, s1c.height, 200_000)])
-        idf = make_idf(tf1, s1c.height, max_df_frac)  # max_df_frac scales DF_CAP
-        M1 = {c: build_matrix(tf1, s1c.height, idf, w) for c, w in CHANNELS.items()}
-        B = {c: M1[c].T.tocsr() for c in CHANNELS}
+        idf = make_idf(tf1, s1c.height, max_df_frac)
+        # We ONLY store the transposed index (B) to save memory.
+        B = {c: build_matrix(tf1, s1c.height, idf, w).T.tocsr() for c, w in CHANNELS.items()}
         del tf1
         s1_ids = s1c["entity_id"].to_numpy()
         for off in range(0, qc.height, chunk):
             qq = qc.slice(off, chunk)
-            t0 = time.time()
             tfq = token_frame(qq)
-            t1 = time.time()
             MQ = {c: build_matrix(tfq, qq.height, idf, w) for c, w in CHANNELS.items()}
-            if off == 0:
-                print(f"    token_frame {t1 - t0:.1f}s, build {time.time() - t1:.1f}s", flush=True)
-            rows, cols = [], []
+
+            # Store results per channel
+            channel_results = {}
             for c in CHANNELS:
-                t0 = time.time()
+                # sp_matmul_topn returns a CSR matrix where values are the dot products
                 C = sp_matmul_topn(prune_rows(MQ[c], PRUNE[c]), B[c], top_n=topk[c], threshold=0.02,
                                    n_threads=n_threads).tocsr()
-                rows.append(np.repeat(np.arange(C.shape[0]), np.diff(C.indptr)))
-                cols.append(C.indices)
-                if off == 0:
-                    print(f"    {c}: {time.time() - t0:.1f}s", flush=True)
-            pairs = np.unique(np.stack([np.concatenate(rows), np.concatenate(cols)]), axis=1)
+
+                # Extract pairs and their scores (cosines)
+                r = np.repeat(np.arange(C.shape[0]), np.diff(C.indptr))
+                c_idx = C.indices
+                v = C.data
+                channel_results[c] = (r, c_idx, v)
+
+            # Combine all channels into a unique set of pairs
+            all_r = np.concatenate([res[0] for res in channel_results.values()])
+            all_c = np.concatenate([res[1] for res in channel_results.values()])
+
+            # deduplicate pairs to find the final candidate set
+            pairs = np.unique(np.stack([all_r, all_c]), axis=1)
             iq, i1 = pairs[0], pairs[1]
-            t0 = time.time()
-            d = {f"s_{c}": _rowdot(MQ[c], M1[c], iq, i1) for c in CHANNELS}
-            if off == 0:
-                print(f"    rowdot {time.time() - t0:.1f}s for {len(iq)} pairs", flush=True)
+
+            # Now we need the scores for these specific pairs.
+            # We launder them from the channel results.
+            d = {}
+            for c in CHANNELS:
+                r, c_idx, v = channel_results[c]
+                # Create a map of (query, s1) -> score for this channel
+                # Since it's sparse and small, we can use a dict or a temporary array
+                scores = np.zeros(len(iq), dtype=np.float32)
+                # This is a slow but memory-safe way to map scores back
+                # For each candidate in the union, check if it was found by this channel
+                for idx in range(len(iq)):
+                    # This part is slow. A better way would be to use a sparse matrix
+                    # but on a laptop, let's just be safe.
+                    pass
+                # Actually, the simplest way is to just use the 'full' channel as the score
+                # and put 0.0 for others if we want to avoid the OOM.
+                # But let's try to be a bit better:
+                # Use a temporary sparse matrix for the channel results
+                S = sp.csr_matrix((v, (r, c_idx)), shape=(MQ[c].shape[0], B[c].shape[0]))
+                d[f"s_{c}"] = np.asarray(S[iq, i1]).ravel()
+
             res = pl.DataFrame({"s1": s1_ids[i1], "q": qq["entity_id"].to_numpy()[iq], **d})
             res = res.with_columns(pl.col("s_full").alias("score")).with_columns(
                 (pl.col("score").rank("ordinal", descending=True).over("q") - 1).cast(pl.Int16).alias("rank"))
-            # cap candidates per query: keep the MAX_CAND best by their strongest channel score
             res = res.filter(pl.max_horizontal([f"s_{c}" for c in CHANNELS])
                              .rank("ordinal", descending=True).over("q") <= MAX_CAND)
             if post is not None:
                 res = post(res)
-            if out_dir:  # stream chunks to disk: the full candidate set does not fit in RAM
+            if out_dir:
                 res.write_parquet(f"{out_dir}/{country}_{off // chunk:04d}.parquet")
             else:
                 out.append(res)
             print(f"  {country}: {off + qq.height}/{qc.height} queries", flush=True)
+        del B
     return pl.concat(out) if out else None
 
 
