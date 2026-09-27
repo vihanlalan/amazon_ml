@@ -141,7 +141,8 @@ def sweep(truth, pred, name):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
-    ap.add_argument("--frac", type=float, required=True, help="same --frac as the train build")
+    ap.add_argument("--frac", type=float, default=None,
+                    help="same --frac as the train build (auto-detected from the feature files if omitted)")
     ap.add_argument("--sample", type=float, default=0.5, help="share of train queries used to fit")
     ap.add_argument("--rounds", type=int, default=400)
     ap.add_argument("--lr", type=float, default=None)
@@ -156,6 +157,12 @@ def main():
     global SUFFIX
     SUFFIX = "_aug" if a.aug else ""
     W, t0 = a.work, time.time()
+    if a.frac is None:  # share of train queries present in the train build
+        nq = pl.scan_parquet(os.path.join(W, "feat_train", "*.parquet")).select(pl.col("q").n_unique()).collect().item()
+        tot = sum(pl.scan_parquet(os.path.join(W, f"norm_train_source{s}.parquet")).select(pl.len()).collect().item()
+                  for s in (2, 3))
+        a.frac = round(nq / tot, 2)
+        print(f"auto-detected --frac {a.frac} ({nq} of {tot} train queries in the build)", flush=True)
     meta = {"model": a.model, "device": a.device}
     log = lambda s: print(f"[{time.time() - t0:5.0f}s] {s}", flush=True)
     tr_files = by_country(W, "train")
