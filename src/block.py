@@ -55,9 +55,9 @@ def token_frame(df: pl.DataFrame) -> pl.DataFrame:
     kw = pl.col("k").list.eval(pl.element().filter(pl.element().str.len_chars() >= 2)).list.unique()
     aw = pl.col("a").list.eval(pl.element().filter(
         (pl.element().str.len_chars() >= 3) & ~pl.element().str.contains(r"\d"))).list.unique()
-    # cap address words: long (Indian) addresses would otherwise explode quadratically
-    pb = base.select("row", kw.list.head(5).alias("kw"), aw.list.head(8).alias("aw"),
-                     aw.list.head(6).alias("aw6"))
+    # Increase caps to prevent missing matches in long names/addresses
+    pb = base.select("row", kw.list.head(20).alias("kw"), aw.list.head(20).alias("aw"),
+                     aw.list.head(20).alias("aw6"))
     parts = [_pairs(pb, "kw", "kw", True), _pairs(pb, "kw", "aw", False), _pairs(pb, "aw6", "aw6", True)]
     for f, minlen in (("n", 2), ("k", 2), ("a", 1), ("d", 3), ("c", 4)):
         t = base.select("row", pl.col(f).alias("tok")).explode("tok")
@@ -135,7 +135,7 @@ def _rowdot(A: sp.csr_matrix, B: sp.csr_matrix, ia: np.ndarray, ib: np.ndarray) 
 
 
 def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
-                    chunk: int = 250_000, n_threads: int = max(os.cpu_count() - 2, 1), topk: dict = None,
+                    chunk: int = 50_000, n_threads: int = max(os.cpu_count() - 2, 1), topk: dict = None,
                     out_dir: str = None, post=None) -> pl.DataFrame:
     """For each query row, the union of per-channel top-k S1 rows of the same country.
     Returns (s1, q, s_full, s_name, s_addr, score, rank)."""
@@ -199,6 +199,6 @@ def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
 # ("laptop") keeps the settings above. Train and test MUST be built with the same profile.
 if os.environ.get("BLOCK_PROFILE", "laptop") == "big":
     DF_CAP = {"n": 0.01, "k": 0.01, "a": 0.01, "d": 0.01, "c": 0.003, "x": 0.01}
-    TOPK = {"full": 8, "name": 5, "addr": 5, "pair": 12}
-    PRUNE = {"full": 14, "name": 8, "addr": 8, "pair": 30}
-    MAX_CAND = 15
+    TOPK = {"full": 15, "name": 10, "addr": 10, "pair": 20}
+    PRUNE = {"full": 20, "name": 12, "addr": 12, "pair": 40}
+    MAX_CAND = 30

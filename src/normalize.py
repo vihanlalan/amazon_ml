@@ -24,7 +24,7 @@ LEGAL = {
     "llc": "llc", "lllc": "llc", "llp": "llp", "lp": "lp", "pllc": "pllc", "pc": "pc", "plc": "plc",
     "public": "public", "sarl": "sarl", "sas": "sas", "sasu": "sasu", "sa": "sa", "eurl": "eurl",
     "sci": "sci", "snc": "snc", "ei": "ei", "ets": "ets", "etablissement": "ets",
-    "etablissements": "ets", "gmbh": "gmbh", "ag": "ag", "oyj": "oyj", "nv": "nv", "bv": "bv",
+    "etablissements": "ets", "auto-entrepreneur": "ae", "micro-entreprise": "me", "gmbh": "gmbh", "ag": "ag", "oyj": "oyj", "nv": "nv", "bv": "bv",
     "ms": "ms",  # "M/s" prefix common in Indian names
     # anyascii transliterations of Indic legal forms
     "praivet": "pvt", "privet": "pvt", "pra": "pvt", "li": "ltd", "limitid": "ltd",

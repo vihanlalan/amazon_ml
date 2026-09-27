@@ -85,7 +85,9 @@ def pair_features(pairs: pl.DataFrame, s1n: pl.DataFrame, qn: pl.DataFrame) -> p
         pl.col("nums_b").list.set_difference("nums").list.len().alias("nums_b_only"),
         (pl.col("nums").list.first() == pl.col("nums_b").list.first()).cast(pl.Int8).fill_null(-1).alias("num1_eq"),
         _num_max("nums").alias("_ma"), _num_max("nums_b").alias("_mb"),
+        pl.col("nums").list.first().count().over(["q", "nums"]).cast(pl.Int8).alias("num_consensus"),
         (pl.col("addr_n").fill_null("").str.len_chars() == 0).cast(pl.Int8).alias("addr_a_empty"),
+
         (pl.col("addr_n_b").fill_null("").str.len_chars() == 0).cast(pl.Int8).alias("addr_b_empty"),
         pl.col("core_n").fill_null("").str.len_chars().alias("core_len_a"),
         pl.col("core_n_b").fill_null("").str.len_chars().alias("core_len_b"),
