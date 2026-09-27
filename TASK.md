@@ -43,7 +43,22 @@ For every S1 record, find all S2/S3 records that are the same business.
    best S1 if probability ≥ threshold. Writes `output/matching_results.tsv` and
    `output/candidate_pairs.tsv`.
 
-### Current baseline (laptop, 8 GB RAM)
+### UPDATE 17:15 IST: v2 blocking (pushed; use this version)
+
+The first leaderboard submission scored **0.939** (the CV said 0.942, so the CV is reliable).
+Error analysis: even a perfect matcher on the old candidates would only reach ~0.959, so the
+main loss was blocking. Cause: the generator draws names/streets from a small vocabulary, so
+single words are common and got dropped by the DF cap, leaving only house numbers, which
+the noise corrupts. v2 adds a **"pair" channel** of conjunction tokens (name×name,
+name×address word, address×address word):
+* US blocking recall 94% → **98.1%**, India 92% → **95.5%** (the rest is mostly transliteration).
+* Candidates are capped at 10 per query; features gained `s_pair*` columns.
+
+The laptop is rebuilding with v2 now (train `--frac 0.2`), but it takes ~4–5 h there, which
+is very tight for the deadline. **On the GPU machine, run v2 with `--frac 0.3` for train (and pass
+`--frac 0.3` to `train`).** Step 1 (blocking config choice) is optional now; v2 is the default.
+
+### Old baseline (laptop, 8 GB RAM)
 
 * LightGBM, CPU, 25% of train queries, 400 rounds → **CV macro F0.5 = 0.9424** at threshold 0.35.
 * Main weakness: **blocking recall**. Only ~92% of true India pairs reach the candidate set,

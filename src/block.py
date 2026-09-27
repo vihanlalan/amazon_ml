@@ -28,8 +28,10 @@ CHANNELS = {
     "full": {"n": 1.0, "k": 0.6, "a": 1.0, "d": 1.0},
     "name": {"n": 1.0, "k": 0.6, "c": 0.5},
     "addr": {"a": 1.0, "d": 1.0},
+    "pair": {"x": 1.0},
 }
-TOPK = {"full": 5, "name": 3, "addr": 3}
+TOPK = {"full": 5, "name": 3, "addr": 3, "pair": 8}
+MAX_CAND = 10
 
 
 def token_frame(df: pl.DataFrame) -> pl.DataFrame:
@@ -46,7 +48,15 @@ def token_frame(df: pl.DataFrame) -> pl.DataFrame:
         .alias("d"),
         _ngrams(pl.col("core_n").str.replace_all(" ", ""), 4).alias("c"),
     )
-    parts = []
+    # pair tokens: the generator draws names/streets from a small vocabulary, so single words
+    # are common (and dropped by the DF cap) while their *combinations* are distinctive.
+    # name x name, name x address-word, address-word x address-word (order-free, typo-robust
+    # via skeletons for names; numbers excluded because the noise corrupts them).
+    kw = pl.col("k").list.eval(pl.element().filter(pl.element().str.len_chars() >= 2)).list.unique()
+    aw = pl.col("a").list.eval(pl.element().filter(
+        (pl.element().str.len_chars() >= 3) & ~pl.element().str.contains(r"\d"))).list.unique()
+    pb = base.select("row", kw.alias("kw"), aw.alias("aw"))
+    parts = [_pairs(pb, "kw", "kw", True), _pairs(pb, "kw", "aw", False), _pairs(pb, "aw", "aw", True)]
     for f, minlen in (("n", 2), ("k", 2), ("a", 1), ("d", 3), ("c", 4)):
         t = base.select("row", pl.col(f).alias("tok")).explode("tok")
         t = t.filter(pl.col("tok").str.len_chars() >= minlen)
@@ -55,6 +65,15 @@ def token_frame(df: pl.DataFrame) -> pl.DataFrame:
     return tf.with_columns(
         ((pl.col("f") + "|" + pl.col("tok")).hash(seed=42) % DIM).cast(pl.Int32).alias("h")
     ).select("row", "h", "f").unique(["row", "h"])
+
+
+def _pairs(pb: pl.DataFrame, lc: str, rc: str, same: bool) -> pl.DataFrame:
+    t = pb.select("row", pl.col(lc).alias("_l"), pl.col(rc).alias("_r")).explode("_l").explode("_r").drop_nulls()
+    if same:
+        t = t.filter(pl.col("_l") < pl.col("_r"))
+    tag = "nn" if lc == rc == "kw" else ("na" if lc != rc else "aa")
+    return t.select("row", (pl.lit(tag + ":") + pl.col("_l") + "|" + pl.col("_r")).alias("tok"),
+                    pl.lit("x").alias("f"))
 
 
 def _ngrams(e: pl.Expr, n: int, max_len: int = 40) -> pl.Expr:
@@ -78,7 +97,7 @@ def build_matrix(tf: pl.DataFrame, n_rows: int, idf: np.ndarray, weights: dict) 
 
 # per-family document-frequency caps (fraction of index size): char n-grams are the most
 # numerous and most expensive, so they are capped hardest
-DF_CAP = {"n": 0.003, "k": 0.003, "a": 0.003, "d": 0.003, "c": 0.002}
+DF_CAP = {"n": 0.003, "k": 0.003, "a": 0.003, "d": 0.003, "c": 0.002, "x": 0.003}
 
 
 def make_idf(tf: pl.DataFrame, n_docs: int, scale: float = 1.0) -> np.ndarray:
@@ -92,7 +111,7 @@ def make_idf(tf: pl.DataFrame, n_docs: int, scale: float = 1.0) -> np.ndarray:
     return idf
 
 
-PRUNE = {"full": 10, "name": 6, "addr": 6}
+PRUNE = {"full": 10, "name": 6, "addr": 6, "pair": 20}
 
 
 def prune_rows(m: sp.csr_matrix, keep: int) -> sp.csr_matrix:
@@ -157,6 +176,9 @@ def topk_candidates(s1: pl.DataFrame, q: pl.DataFrame, max_df_frac: float = 1.0,
             res = pl.DataFrame({"s1": s1_ids[i1], "q": qq["entity_id"].to_numpy()[iq], **d})
             res = res.with_columns(pl.col("s_full").alias("score")).with_columns(
                 (pl.col("score").rank("ordinal", descending=True).over("q") - 1).cast(pl.Int16).alias("rank"))
+            # cap candidates per query: keep the MAX_CAND best by their strongest channel score
+            res = res.filter(pl.max_horizontal([f"s_{c}" for c in CHANNELS])
+                             .rank("ordinal", descending=True).over("q") <= MAX_CAND)
             if post is not None:
                 res = post(res)
             if out_dir:  # stream chunks to disk: the full candidate set does not fit in RAM

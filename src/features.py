@@ -23,13 +23,13 @@ def context_features(cand: pl.DataFrame) -> pl.DataFrame:
     # only query-side context: every query sees the full S1 index in train and test alike
     # (S1-side counts would shift because train queries are subsampled)
     ex = []
-    for c in ("s_full", "s_name", "s_addr"):
+    for c in ("s_full", "s_name", "s_addr", "s_pair"):
         ex += [pl.col(c).max().over("q").alias(f"{c}_qbest"),
                pl.when(pl.len().over("q") > 1).then(pl.col(c).top_k(2).min().over("q"))
                  .otherwise(0.0).alias(f"{c}_qsecond")]
     return cand.with_columns(pl.len().over("q").alias("q_ncand"), *ex).with_columns(
-        *[(pl.col(f"{c}_qbest") - pl.col(c)).alias(f"{c}_gap") for c in ("s_full", "s_name", "s_addr")],
-        *[(pl.col(c) - pl.col(f"{c}_qsecond")).alias(f"{c}_margin") for c in ("s_full", "s_name", "s_addr")],
+        *[(pl.col(f"{c}_qbest") - pl.col(c)).alias(f"{c}_gap") for c in ("s_full", "s_name", "s_addr", "s_pair")],
+        *[(pl.col(c) - pl.col(f"{c}_qsecond")).alias(f"{c}_margin") for c in ("s_full", "s_name", "s_addr", "s_pair")],
     )
 
 
@@ -67,7 +67,7 @@ def pair_features(pairs: pl.DataFrame, s1n: pl.DataFrame, qn: pl.DataFrame) -> p
         "addr_alpha_partial": _sim(aaa, aab, fuzz.partial_ratio),
     }
     out = d.select(
-        "s1", "q", "rank", "q_ncand", pl.col("^s_(full|name|addr).*$"),
+        "s1", "q", "rank", "q_ncand", pl.col("^s_(full|name|addr|pair).*$"),
         pl.col("q").str.starts_with("S2").cast(pl.Int8).alias("is_s2"),
         # token set arithmetic on names
         _tok_feats("core_n", "core_n_b", "core"),
