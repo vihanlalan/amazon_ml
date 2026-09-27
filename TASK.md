@@ -43,6 +43,30 @@ For every S1 record, find all S2/S3 records that are the same business.
    best S1 if probability ≥ threshold. Writes `output/matching_results.tsv` and
    `output/candidate_pairs.tsv`.
 
+### UPDATE 22:10 IST: FINAL RUN = augment + stack (no blocking rebuild)
+
+New generator-aware features (`src/augment.py`): house-number corruption vs decoy shift
+(dropped digit / leading zeros / changed first digit vs same-length small shift), digit edit
+distance, and the *type* of extra name words (legal form vs business word). Stage 2 also gets
+**decoy-group** features: candidates of an S1 that share a house number different from the S1's.
+Small-subset test: better than plain stack on both stages.
+
+```bash
+git pull
+# 1) add features to the existing feature files (the two can run in parallel), ~10-25 min
+python src/augment.py --work work --split train
+python src/augment.py --work work --split test
+# 2) stack on the augmented files (same <F> as the train build: 0.5 for "big", 0.3 for run_all.sh)
+python src/stack.py --work work --frac <F> --aug --out output_aug --model xgb --device cuda --sample 1.0 --rounds 800
+#    no GPU:  --model lgbm --device cpu --sample 0.5 --rounds 400
+python student_resource/utils/validate_submission.py --matching output_aug/matching_results.tsv --candidate output_aug/candidate_pairs.tsv --test-dir student_resource/dataset/test
+```
+
+* If the plain `stack.py` run (UPDATE 21:15) is already going, **let it finish** and start
+  `augment.py` alongside it (it only reads `feat_*` and writes `feat_*_aug`).
+* **Upload whichever finished run printed the highest `best thr` CV**, as long as it beats the 0.961
+  run and passes the validator. **Stop anything still running at 23:30** and upload the best finished result.
+
 ### UPDATE 21:15 IST: NEXT RUN = `src/stack.py` (no rebuild needed)
 
 Last run scored **0.961** on the leaderboard. The v2 error analysis shows ~0.018 of F0.5 is lost

@@ -31,6 +31,9 @@ from metric import macro_f05
 from pipeline import PARAMS, XGB_PARAMS, eval_truth, fit_model, predict_model, write_outputs
 
 SRC = ["s1", "q", "nummax_eq"]
+HN = ["_shn", "_qhn"]            # hidden main house numbers (augment.py), used for group features
+HN_CTX = ["hn_cluster_oth", "hn_cluster_conf_oth", "q_is_s1hn", "s1_conf_s1hn", "hn_rival"]
+SUFFIX = ""                      # "_aug" with --aug
 CTX = ["p1", "p1_qmax", "p1_qsecond", "p1_gap", "p1_margin", "p1_qrank", "q_nconf",
        "s1_n", "s1_nconf", "s1_psum", "s1_pmax", "p1_s1rank", "s1_conf_numeq", "s1_conf_numneq",
        "s1_nbestof", "s1_oth_conf", "s1_oth_psum", "s1_oth_conf_numeq", "s1_oth_bestof",
@@ -48,7 +51,7 @@ def in_sample(sample):
 
 def by_country(W, split):
     out = {}
-    for f in sorted(glob.glob(os.path.join(W, f"feat_{split}", "*.parquet"))):
+    for f in sorted(glob.glob(os.path.join(W, f"feat_{split}{SUFFIX}", "*.parquet"))):
         out.setdefault(os.path.basename(f).split("_")[0], []).append(f)
     return out
 
@@ -106,7 +109,23 @@ def group_features(d: pl.DataFrame) -> pl.DataFrame:
     # a candidate whose house number disagrees while other confident candidates agree with S1
     d = d.with_columns(((pl.col("nummax_eq") == 0) & (pl.col("s1_oth_conf_numeq") > 0))
                        .cast(pl.Int8).alias("num_conflict"))
-    return d.select("s1", "q", *CTX)
+    extra = []
+    if "_qhn" in d.columns:
+        has = pl.col("_qhn") != ""
+        C = ["s1", "g", "_qhn"]
+        d = d.with_columns(
+            pl.when(has).then(pl.len().over(C) - 1).otherwise(0).cast(pl.Int32).alias("hn_cluster_oth"),
+            pl.when(has).then(conf.cast(pl.Int32).sum().over(C) - conf.cast(pl.Int32)).otherwise(0)
+              .cast(pl.Int32).alias("hn_cluster_conf_oth"),
+            (has & (pl.col("_qhn") == pl.col("_shn"))).cast(pl.Int8).alias("q_is_s1hn"),
+        )
+        d = d.with_columns(
+            (conf & (pl.col("q_is_s1hn") == 1)).cast(pl.Int32).sum().over(G).alias("s1_conf_s1hn"),
+            # this record's number differs from S1's but is shared by other candidates: a decoy group
+            (has & (pl.col("q_is_s1hn") == 0) & (pl.col("hn_cluster_oth") > 0)).cast(pl.Int8).alias("hn_rival"),
+        )
+        extra = HN_CTX
+    return d.select("s1", "q", *CTX, *extra)
 
 
 def sweep(truth, pred, name):
@@ -129,18 +148,24 @@ def main():
     ap.add_argument("--model", choices=["lgbm", "xgb"], default="lgbm")
     ap.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     ap.add_argument("--out", default="output")
+    ap.add_argument("--aug", action="store_true", help="use feat_*_aug from augment.py")
     a = ap.parse_args()
     if a.lr:
         PARAMS["learning_rate"] = a.lr
         XGB_PARAMS["learning_rate"] = a.lr
+    global SUFFIX
+    SUFFIX = "_aug" if a.aug else ""
     W, t0 = a.work, time.time()
     meta = {"model": a.model, "device": a.device}
     log = lambda s: print(f"[{time.time() - t0:5.0f}s] {s}", flush=True)
     tr_files = by_country(W, "train")
     te_files = by_country(W, "test")
-    feats = feature_names(pl.scan_parquet(next(iter(tr_files.values()))[0]).head(1).collect())
+    head = pl.scan_parquet(next(iter(tr_files.values()))[0]).head(1).collect()
+    feats = [c for c in feature_names(head) if not c.startswith("_")]
+    src = SRC + [c for c in HN if c in head.columns]
+    tag = SUFFIX
     for d in ("p1_train", "p1_test", "ctx_train", "ctx_test", "pred2_test", "pred1_test"):
-        os.makedirs(os.path.join(W, d), exist_ok=True)
+        os.makedirs(os.path.join(W, d + tag), exist_ok=True)
 
     # ---- stage 1: S1-grouped 2-fold OOF on train, final model on test -------------------------
     models = []
@@ -159,8 +184,8 @@ def main():
                 m = fo == k
                 if m.any():
                     p[m] = predict_model(models[k], meta, X[m])
-            ch.select(*SRC, "label").with_columns(pl.Series("p1", p)).write_parquet(
-                os.path.join(W, "p1_train", os.path.basename(f)))
+            ch.select(*src, "label").with_columns(pl.Series("p1", p)).write_parquet(
+                os.path.join(W, "p1_train" + tag, os.path.basename(f)))
     del models
     X, y = load_xy(W, feats, in_sample(a.sample))
     m1 = fit_model(X, y, a.rounds, a.model, a.device)
@@ -169,13 +194,13 @@ def main():
         for f in fs:
             ch = pl.read_parquet(f)
             p = predict_model(m1, meta, ch.select(feats).to_numpy().astype(np.float32))
-            ch.select(*SRC).with_columns(pl.Series("p1", p, dtype=pl.Float32)).write_parquet(
-                os.path.join(W, "p1_test", os.path.basename(f)))
+            ch.select(*src).with_columns(pl.Series("p1", p, dtype=pl.Float32)).write_parquet(
+                os.path.join(W, "p1_test" + tag, os.path.basename(f)))
     del m1
     log("stage1 done")
 
     truth = eval_truth(W, a.frac)
-    oof1 = pl.scan_parquet(os.path.join(W, "p1_train", "*.parquet")).select("s1", "q", pl.col("p1").alias("p")).collect()
+    oof1 = pl.scan_parquet(os.path.join(W, "p1_train" + tag, "*.parquet")).select("s1", "q", pl.col("p1").alias("p")).collect()
     thr1, cv1 = sweep(truth, oof1, "stage1 CV")
     del oof1
 
@@ -183,14 +208,15 @@ def main():
     G = max(1, round(1 / a.frac))
     for split, files in (("train", tr_files), ("test", te_files)):
         for c in files:
-            d = pl.scan_parquet(os.path.join(W, f"p1_{split}", f"{c}_*.parquet")).collect()
+            d = pl.scan_parquet(os.path.join(W, f"p1_{split}" + tag, f"{c}_*.parquet")).collect()
             g = pl.lit(0) if split == "train" else (pl.col("q").hash(seed=17) % G)
-            group_features(d.with_columns(g.alias("g"))).write_parquet(os.path.join(W, f"ctx_{split}", f"{c}.parquet"))
+            group_features(d.with_columns(g.alias("g"))).write_parquet(os.path.join(W, f"ctx_{split}" + tag, f"{c}.parquet"))
     log(f"group features done (test groups: {G})")
 
     # ---- stage 2: same S1 folds ------------------------------------------------------------------
-    feats2 = feats + CTX
-    ctxd = os.path.join(W, "ctx_train")
+    ctx_cols = pl.read_parquet_schema(glob.glob(os.path.join(W, "ctx_train" + tag, "*.parquet"))[0])
+    feats2 = feats + [c for c in ctx_cols if c not in ("s1", "q")]
+    ctxd = os.path.join(W, "ctx_train" + tag)
     oof2 = []
     for fold in (0, 1):
         X, y = load_xy(W, feats2, (s1fold() != fold) & in_sample(a.sample), ctxd)
@@ -214,22 +240,22 @@ def main():
         m2 = fit_model(X, y, a.rounds, a.model, a.device)
         del X, y
         for c, fs in te_files.items():
-            cx = pl.read_parquet(os.path.join(W, "ctx_test", f"{c}.parquet"))
+            cx = pl.read_parquet(os.path.join(W, "ctx_test" + tag, f"{c}.parquet"))
             for f in fs:
                 ch = pl.read_parquet(f).join(cx, on=["s1", "q"], how="left")
                 ch.select("s1", "q").with_columns(pl.Series(
                     "p", predict_model(m2, meta, ch.select(feats2).to_numpy().astype(np.float32)), dtype=pl.Float32)
-                ).write_parquet(os.path.join(W, "pred2_test", os.path.basename(f)))
-        pred_dir, thr, used = "pred2_test", thr2, "stage2"
+                ).write_parquet(os.path.join(W, "pred2_test" + tag, os.path.basename(f)))
+        pred_dir, thr, used = "pred2_test" + tag, thr2, "stage2"
     else:
-        for f in glob.glob(os.path.join(W, "p1_test", "*.parquet")):
+        for f in glob.glob(os.path.join(W, "p1_test" + tag, "*.parquet")):
             pl.read_parquet(f).select("s1", "q", pl.col("p1").alias("p")).write_parquet(
-                os.path.join(W, "pred1_test", os.path.basename(f)))
-        pred_dir, thr, used = "pred1_test", thr1, "stage1"
+                os.path.join(W, "pred1_test" + tag, os.path.basename(f)))
+        pred_dir, thr, used = "pred1_test" + tag, thr1, "stage1"
     write_outputs(W, pl.scan_parquet(os.path.join(W, pred_dir, "*.parquet")), thr, a.out)
     json.dump({"used": used, "cv_stage1": cv1, "thr_stage1": thr1, "cv_stage2": cv2, "thr_stage2": thr2,
                "frac": a.frac, "test_groups": G, "model": a.model},
-              open(os.path.join(W, "stack_meta.json"), "w"), indent=1)
+              open(os.path.join(W, f"stack_meta{tag}.json"), "w"), indent=1)
     log(f"DONE: used {used} (stage1 CV {cv1:.5f}, stage2 CV {cv2:.5f}), outputs in {a.out}")
 
 
