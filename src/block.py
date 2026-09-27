@@ -56,9 +56,14 @@ def token_frame(df: pl.DataFrame) -> pl.DataFrame:
     aw = pl.col("a").list.eval(pl.element().filter(
         (pl.element().str.len_chars() >= 3) & ~pl.element().str.contains(r"\d"))).list.unique()
     # cap address words: long (Indian) addresses would otherwise explode quadratically
+    # digit-only address codes of ANY length (truncated addresses keep just '#2/C', '26', 'Plot 38');
+    # combined with name words / address words they become rare, specific pair tokens
+    dg = pl.col("d").list.eval(pl.element().str.replace_all(r"\D", "").str.replace(r"^0+", ""))
+    dg = dg.list.eval(pl.element().filter(pl.element() != "")).list.unique(maintain_order=True).list.head(3)
     pb = base.select("row", kw.list.head(5).alias("kw"), aw.list.head(8).alias("aw"),
-                     aw.list.head(6).alias("aw6"))
-    parts = [_pairs(pb, "kw", "kw", True), _pairs(pb, "kw", "aw", False), _pairs(pb, "aw6", "aw6", True)]
+                     aw.list.head(6).alias("aw6"), dg.alias("dg"))
+    parts = [_pairs(pb, "kw", "kw", True), _pairs(pb, "kw", "aw", False), _pairs(pb, "aw6", "aw6", True),
+             _pairs(pb, "kw", "dg", False), _pairs(pb, "aw6", "dg", False)]
     for f, minlen in (("n", 2), ("k", 2), ("a", 1), ("d", 3), ("c", 4)):
         t = base.select("row", pl.col(f).alias("tok")).explode("tok")
         t = t.filter(pl.col("tok").str.len_chars() >= minlen)
@@ -73,7 +78,10 @@ def _pairs(pb: pl.DataFrame, lc: str, rc: str, same: bool) -> pl.DataFrame:
     t = pb.select("row", pl.col(lc).alias("_l"), pl.col(rc).alias("_r")).explode("_l").explode("_r").drop_nulls()
     if same:
         t = t.filter(pl.col("_l") < pl.col("_r"))
-    tag = {"kw": "nn", "aw6": "aa"}[lc] if lc == rc else "na"
+    if lc == rc:
+        tag = {"kw": "nn", "aw6": "aa"}[lc]
+    else:
+        tag = {("kw", "aw"): "na", ("kw", "dg"): "nd"}.get((lc, rc), "ad")
     return t.select("row", (pl.lit(tag + ":") + pl.col("_l") + "|" + pl.col("_r")).alias("tok"),
                     pl.lit("x").alias("f"))
 
